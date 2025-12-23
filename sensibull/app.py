@@ -3,28 +3,113 @@ import sqlite3
 import json
 from datetime import datetime, timedelta
 from database import get_db, sync_profiles
+import sys
+import os
+import threading
+import time
+import subprocess
 
 app = Flask(__name__)
 # Configure standard port or 5010 as per previous context
 PORT = 6060
 
+# Global variable to track last restart to prevent loops
+LAST_AUTO_RESTART = None
+
 @app.template_filter('to_datetime')
 def to_datetime_filter(value):
-    ist_shift = timedelta(hours=5, minutes=30)
+    # Timestamps in DB are now consistently Naive IST (from scraper datetime.now())
+    # So we do NOT add any offset. We just ensure it's a datetime object.
     if isinstance(value, datetime):
-        return value + ist_shift
-    # Handle SQLite default string format: "YYYY-MM-DD HH:MM:SS"
+        return value
+    
     try:
-        dt = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
-        return dt + ist_shift
+        return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
     except ValueError:
         try:
-             # Handle ISO format if present
+             # Handle ISO format
              dt = datetime.fromisoformat(value)
-             return dt + ist_shift
+             return dt.replace(tzinfo=None) # Ensure naive
         except:
              return value
 
+def is_market_open():
+    now = datetime.now()
+    # Weekday check: 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
+    if now.weekday() > 4:
+        return False
+    
+    # Time check: 09:15 to 15:30
+    current_time = now.time()
+    start_time = datetime.strptime("09:15", "%H:%M").time()
+    end_time = datetime.strptime("15:30", "%H:%M").time()
+    
+    return start_time <= current_time <= end_time
+
+def restart_scraper_internal():
+    print("Restarting scraper process...")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    scraper_path = os.path.join(base_dir, 'scraper.py')
+    log_file = os.path.join(base_dir, 'scraper.log')
+    
+    # Kill existing
+    os.system("pkill -f 'vibhu/sensibull/scraper.py'")
+    
+    # Start new
+    cmd = f"nohup python3 {scraper_path} >> {log_file} 2>&1 &"
+    os.system(cmd)
+    
+def monitor_scraper():
+    """Background thread to monitor scraper and restart if stuck"""
+    global LAST_AUTO_RESTART
+    print("Scraper monitor thread started.")
+    
+    while True:
+        try:
+            # Check every minute
+            time.sleep(60)
+            
+            if not is_market_open():
+                continue
+                
+            # Check DB for last update
+            conn = get_db()
+            c = conn.cursor()
+            last_updated_row = c.execute("SELECT MAX(timestamp) FROM latest_snapshots").fetchone()
+            conn.close()
+            
+            last_updated = last_updated_row[0] if last_updated_row else None
+            
+            should_restart = False
+            
+            if last_updated:
+                last_dt = to_datetime_filter(last_updated)
+                time_diff = (datetime.now() - last_dt).total_seconds()
+                
+                # If no update for > 5 minutes (300 seconds)
+                if time_diff > 300:
+                    print(f"Monitor: Scraper stuck! Last update {time_diff}s ago.")
+                    should_restart = True
+            else:
+                 # If no data at all and market is open, maybe assume stuck? 
+                 # Or maybe database is empty. Let's be conservative and only restart if data exists but is stale,
+                 # or perhaps if empty database persists for long. 
+                 # For now, only restart if stale.
+                 pass
+                 
+            if should_restart:
+                # Check cooldown (don't restart if we just restarted < 5 mins ago)
+                if LAST_AUTO_RESTART and (datetime.now() - LAST_AUTO_RESTART).total_seconds() < 300:
+                    print("Monitor: Skipping restart due to cooldown.")
+                else:
+                    print("Monitor: Triggering auto-restart.")
+                    restart_scraper_internal()
+                    LAST_AUTO_RESTART = datetime.now()
+                    
+        except Exception as e:
+            print(f"Monitor error: {e}")
+            # Sleep a bit to avoid rapid loops on error
+            time.sleep(10)
 
 @app.route('/')
 def index():
@@ -59,16 +144,11 @@ def index():
     # Sort the DB profiles: those in urls.txt first (in order), others after
     profiles = sorted(profiles_db, key=lambda p: sort_map.get(p['slug'], 99999))
 
-    # Calculate dates (last 7 days?)
-    # ... existing logic ...
-    
-    # Need to adapt existing logic because it probably did a single fetch
-    # Let's inspect the original code in the next few lines in view_file usage
-    # but I already see it.
+    # Calculate dates (last 30 days)
     
     # We have profiles now. Now get dates.
     # Get unique dates from changes
-    dates_rows = c.execute("SELECT DISTINCT date(timestamp) as day FROM position_changes ORDER BY day DESC LIMIT 7").fetchall()
+    dates_rows = c.execute("SELECT DISTINCT date(timestamp) as day FROM position_changes ORDER BY day DESC LIMIT 30").fetchall()
     dates = [row['day'] for row in dates_rows]
     
     # Build matrix
@@ -91,9 +171,21 @@ def index():
     # Get global last updated time
     last_updated_row = c.execute("SELECT MAX(timestamp) FROM latest_snapshots").fetchone()
     last_updated = last_updated_row[0] if last_updated_row else None
+    
+    scraper_error = None
+    if not is_market_open():
+        scraper_error = "Scraper is paused (Market Closed)"
+    else:
+        # Check if stuck (no update in last 3 minutes)
+        if last_updated:
+            last_dt = to_datetime_filter(last_updated)
+            if (datetime.now() - last_dt).total_seconds() > 180:
+                scraper_error = "Scraper is stuck or not running! (Last update > 3 mins ago)"
+        else:
+             scraper_error = "Scraper has no data yet!"
 
     conn.close()
-    return render_template('index.html', profiles=profiles, dates=dates, matrix=matrix, last_updated=last_updated)
+    return render_template('index.html', profiles=profiles, dates=dates, matrix=matrix, last_updated=last_updated, scraper_error=scraper_error)
 
 def calculate_snapshot_pnl(c, snapshot_id):
     snap = c.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
@@ -411,20 +503,10 @@ def calculate_diff(prev_map, curr_map):
         'modified': modified
     }
 
-import sys
-import os
-import threading
-import time
-
 @app.route('/restart', methods=['POST'])
-def restart_app():
-    def restart():
-        time.sleep(1) # Give time for response to be sent
-        print("Restarting application...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-    
-    threading.Thread(target=restart).start()
-    return "Restarting application... Please reload the page in a few seconds.", 200
+def restart_scraper_endpoint():
+    threading.Thread(target=restart_scraper_internal).start()
+    return "Restarting scraper process... It should resume in a few seconds.", 200
 
 @app.route('/delete_date/<date>', methods=['DELETE', 'POST'])
 def delete_date(date):
@@ -453,4 +535,6 @@ def delete_date(date):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    # Start monitor thread
+    threading.Thread(target=monitor_scraper, daemon=True).start()
     app.run(debug=False, host='0.0.0.0', port=PORT)

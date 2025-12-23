@@ -45,10 +45,15 @@ def fetch_data(slug):
         print(f"Error fetching {slug}: {e}")
         return None
 
-def save_snapshot(conn, profile_id, data):
+def save_snapshot(conn, profile_id, data, timestamp=None):
     c = conn.cursor()
-    c.execute("INSERT INTO snapshots (profile_id, raw_data, created_at_source) VALUES (?, ?, ?)", 
-              (profile_id, json.dumps(data), data.get('created_at')))
+    # Use provided timestamp (IST) or default to CURRENT_TIMESTAMP (UTC, avoided now)
+    if timestamp:
+         c.execute("INSERT INTO snapshots (profile_id, raw_data, created_at_source, timestamp) VALUES (?, ?, ?, ?)", 
+                  (profile_id, json.dumps(data), data.get('created_at'), timestamp))
+    else:
+         c.execute("INSERT INTO snapshots (profile_id, raw_data, created_at_source) VALUES (?, ?, ?)", 
+                  (profile_id, json.dumps(data), data.get('created_at')))
     return c.lastrowid
 
 def normalize_trades(trades):
@@ -165,7 +170,8 @@ def run_scraper():
             
             # ALWAYS update the latest snapshot for Realtime P&L
             from database import upsert_latest_snapshot
-            upsert_latest_snapshot(conn, profile_id, current_data)
+            now_ist = datetime.now()
+            upsert_latest_snapshot(conn, profile_id, current_data, timestamp=now_ist)
             
         except Exception as e:
             print(f"Error fetching {slug}: {e}")
@@ -174,7 +180,7 @@ def run_scraper():
         # If no last snapshot, save as initial
         if not last_snapshot:
             print(f"-> Initial snapshot for {slug}")
-            snapshot_id = save_snapshot(conn, profile_id, current_data)
+            snapshot_id = save_snapshot(conn, profile_id, current_data, timestamp=datetime.now())
             # Record explicit 'Initial' change so it shows up in UI
             c.execute("INSERT INTO position_changes (profile_id, snapshot_id, timestamp, diff_summary) VALUES (?, ?, ?, ?)",
                       (profile_id, snapshot_id, datetime.now(), "Initial Snapshot"))
@@ -187,7 +193,7 @@ def run_scraper():
         
         if diff:
             print(f"-> CHANGE DETECTED for {slug}")
-            snapshot_id = save_snapshot(conn, profile_id, current_data)
+            snapshot_id = save_snapshot(conn, profile_id, current_data, timestamp=datetime.now())
             
             # Simple diff summary (placeholder, ideally we list added/removed symbols)
             summary = generate_diff_summary(last_data, current_data)

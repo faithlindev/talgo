@@ -68,16 +68,19 @@ def init_db():
     conn.close()
     print("Database initialized.")
 
-def upsert_latest_snapshot(conn, profile_id, data):
+def upsert_latest_snapshot(conn, profile_id, data, timestamp=None):
     c = conn.cursor()
     # SQLite upsert syntax
+    # timestamps are stored as string. If timestamp is provided (datetime), format it.
+    ts_val = timestamp.strftime('%Y-%m-%d %H:%M:%S') if timestamp else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
     c.execute("""
         INSERT INTO latest_snapshots (profile_id, raw_data, timestamp) 
-        VALUES (?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?)
         ON CONFLICT(profile_id) DO UPDATE SET
             raw_data=excluded.raw_data,
-            timestamp=CURRENT_TIMESTAMP
-    """, (profile_id, json.dumps(data)))
+            timestamp=excluded.timestamp
+    """, (profile_id, json.dumps(data), ts_val))
     conn.commit()
 
 def sync_profiles():
